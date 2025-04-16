@@ -1,0 +1,470 @@
+const { PermissionsBitField } = require('discord.js');
+const { logWithTimestamp } = require('./utils');
+
+class MemberTracker {
+    constructor(client) {
+        this.client = client;
+        this.trackedThreads = new Map(); // Map to store thread IDs and their configurations
+        this.checkInterval = null;
+        this.initializing = true;
+        this.checkFrequency = parseInt(process.env.MEMBER_CHECK_FREQUENCY) || 5 * 60 * 1000; // Default: 5 minutes
+    }
+
+    async init() {
+        try {
+            this.initializing = true;
+            
+            // Get MAX_MEMBERS from environment
+            const maxMembers = parseInt(process.env.MAX_MEMBERS);
+            if (isNaN(maxMembers) || maxMembers <= 0) {
+                throw new Error('MAX_MEMBERS environment variable must be a positive number');
+            }
+            
+            // Find all THREAD_X_ID environment variables
+            const threadEnvs = Object.keys(process.env)
+                .filter(key => key.match(/^THREAD_\d+_ID$/))
+                .sort();
+            
+            if (threadEnvs.length === 0) {
+                throw new Error('No THREAD_X_ID variables found in environment');
+            }
+            
+            // Initialize tracked threads
+            for (const threadEnv of threadEnvs) {
+                const threadId = process.env[threadEnv];
+                if (!threadId) continue;
+                
+                try {
+                    const thread = await this.client.channels.fetch(threadId);
+                    if (!thread || !thread.isThread()) {
+                        logWithTimestamp(`Warning: ${threadEnv} (${threadId}) is not a valid thread. Skipping.`, 'WARN');
+                        continue;
+                    }
+                    
+                    this.trackedThreads.set(threadId, {
+                        id: threadId,
+                        envName: threadEnv,
+                        maxMembers: maxMembers,
+                        lastCheck: 0,
+                    });
+                    
+                    logWithTimestamp(`Thread tracked: ${thread.name} (${threadId}) with max ${maxMembers} members`, 'INFO');
+                } catch (error) {
+                    logWithTimestamp(`Error initializing thread ${threadEnv} (${threadId}): ${error.message}`, 'ERROR');
+                }
+            }
+            
+            if (this.trackedThreads.size === 0) {
+                throw new Error('No valid threads found for tracking');
+            }
+            
+            // Set up interval for checking member counts
+            this.checkInterval = setInterval(() => this.checkAllThreads(), this.checkFrequency);
+            
+            // Do an initial check
+            await this.checkAllThreads();
+            
+            this.initializing = false;
+            logWithTimestamp(`Member Tracker initialized with ${this.trackedThreads.size} threads`, 'STARTUP');
+        } catch (error) {
+            this.initializing = false;
+            logWithTimestamp(`Failed to initialize Member Tracker: ${error.message}`, 'ERROR');
+            throw error;
+        }
+    }
+    
+    async checkAllThreads() {
+        for (const [threadId, threadConfig] of this.trackedThreads.entries()) {
+            try {
+                await this.checkThreadMemberCount(threadId);
+            } catch (error) {
+                logWithTimestamp(`Error checking thread ${threadId}: ${error.message}`, 'ERROR');
+            }
+        }
+    }
+    
+    async checkThreadMemberCount(threadId) {
+    const threadConfig = this.trackedThreads.get(threadId);
+    if (!threadConfig) return;
+    
+    try {
+        const thread = await this.client.channels.fetch(threadId)
+            .catch(error => {
+                logWithTimestamp(`Error fetching thread ${threadId}: ${error.message}`, 'ERROR');
+                return null;
+            });
+            
+        if (!thread || !thread.isThread()) {
+            logWithTimestamp(`Thread ${threadId} no longer exists or is not a thread`, 'WARN');
+            return;
+        }
+        
+        // Check if we have an ongoing removal process
+        if (threadConfig.removalState) {
+            logWithTimestamp(`Continuing batch removal for thread ${thread.name} (${threadId})`, 'INFO');
+            await this.removeExcessMembers(thread, threadConfig.maxMembers);
+            
+            // Update last check timestamp even when continuing batch operations
+            threadConfig.lastCheck = Date.now();
+            this.trackedThreads.set(threadId, threadConfig);
+            return;
+        }
+        
+        // Otherwise, perform normal member count check
+        // Get the current member count with better error handling
+        let memberCount;
+        try {
+            const members = await thread.members.fetch();
+            memberCount = members?.size ?? 0;
+        } catch (error) {
+            logWithTimestamp(`Error fetching member count for thread ${threadId}: ${error.message}`, 'ERROR');
+            // If we can't get the member count, skip this check
+            return;
+        }
+        
+        // Log current count periodically
+        logWithTimestamp(`Thread ${thread.name} (${threadId}) has ${memberCount}/${threadConfig.maxMembers} members`, 'INFO');
+        
+        // Check if count exceeds maximum
+        if (memberCount > threadConfig.maxMembers) {
+            logWithTimestamp(`Thread ${thread.name} (${threadId}) exceeds max members: ${memberCount}/${threadConfig.maxMembers}`, 'WARN');
+            await this.removeExcessMembers(thread, threadConfig.maxMembers);
+        }
+        
+        // Update last check timestamp
+        threadConfig.lastCheck = Date.now();
+        this.trackedThreads.set(threadId, threadConfig);
+        
+    } catch (error) {
+        logWithTimestamp(`Error checking thread ${threadId} member count: ${error.message}`, 'ERROR');
+    }
+}
+    async getThreadMemberCount(thread) {
+    try {
+        // Check if thread is valid
+        if (!thread || !thread.members) {
+            logWithTimestamp(`Invalid thread object when getting member count`, 'ERROR');
+            return 0;
+        }
+        
+        // Fetch the members of the thread with error handling
+        const members = await thread.members.fetch()
+            .catch(error => {
+                logWithTimestamp(`Error fetching thread members: ${error.message}`, 'ERROR');
+                return new Map(); // Return empty map on error
+            });
+            
+        return members ? members.size : 0;
+    } catch (error) {
+        logWithTimestamp(`Unexpected error in getThreadMemberCount: ${error.message}`, 'ERROR');
+        return 0;
+    }
+}
+    
+    async removeExcessMembers(thread, maxMembers) {
+    try {
+        // Get the thread members
+        const threadMembers = await thread.members.fetch();
+        
+        // If we're already at or below the limit, no action needed
+        if (threadMembers.size <= maxMembers) return;
+        
+        // Get the guild for role information
+        const guild = thread.guild;
+        
+        // Parse ignored roles from environment variable - using the same logic as in contentoor.js
+        const ignoredRoles = new Set(
+            process.env.IGNORED_ROLES
+                ? process.env.IGNORED_ROLES.split(',').map(role => role.trim())
+                : []
+        );
+        
+        // Calculate how many members need to be removed
+        const excessCount = threadMembers.size - maxMembers;
+        
+        if (excessCount <= 0) {
+            return;
+        }
+        
+        logWithTimestamp(`Removing ${excessCount} members from thread ${thread.name} (${thread.id})`, 'INFO');
+        
+        // Store thread state in the trackedThreads Map
+        const threadConfig = this.trackedThreads.get(thread.id) || {};
+        
+        // Initialize removal state if it doesn't exist
+        if (!threadConfig.removalState) {
+            threadConfig.removalState = {
+                processedCount: 0,
+                targetCount: excessCount,
+                lastBatchTime: Date.now(),
+                remainingMembers: []
+            };
+            
+            // Structure to store members for different categories
+            const categorizedMembers = {
+                nonGuildMembers: [], // Members not in the guild anymore
+                regularMembers: []   // Normal guild members (will be sorted by role and join time)
+            };
+            
+            let memberCount = 0;
+            
+            for (const [id, threadMember] of threadMembers) {
+                try {
+                    // Safety check for undefined threadMember
+                    if (!threadMember || !threadMember.id) {
+                        logWithTimestamp(`Skipping undefined thread member at position ${memberCount}`, 'WARN');
+                        continue;
+                    }
+                    
+                    // Get join timestamp from the thread member
+                    const joinTimestamp = threadMember.joinedTimestamp || 0;
+                    
+                    // Try to get the guild member
+                    const guildMember = await guild.members.fetch(threadMember.id)
+                        .catch(err => {
+                            logWithTimestamp(`Could not fetch guild member ${threadMember.id}: ${err.message}`, 'INFO');
+                            return null;
+                        });
+                    
+                    if (!guildMember) {
+                        // This is a thread member who is no longer in the guild
+                        categorizedMembers.nonGuildMembers.push({
+                            id: threadMember.id,
+                            username: 'Unknown (Left Guild)',
+                            joinTimestamp: joinTimestamp
+                        });
+                        memberCount++;
+                        continue;
+                    }
+                    
+                    // Skip bot accounts
+                    if (guildMember.user?.bot) continue;
+                    
+                    // Skip members with ignored roles
+                    if (guildMember.roles.cache.some(role => ignoredRoles.has(role.id))) {
+                        logWithTimestamp(`Skipping member ${guildMember.user.username} (${guildMember.id}) with ignored role`, 'INFO');
+                        continue;
+                    }
+                    
+                    // Find the highest role position (with safety checks)
+                    const highestRolePosition = guildMember.roles?.highest?.position || 0;
+                    
+                    categorizedMembers.regularMembers.push({
+                        id: threadMember.id,
+                        username: guildMember.user?.username || 'Unknown',
+                        highestRolePosition: highestRolePosition,
+                        joinTimestamp: joinTimestamp
+                    });
+                    
+                    memberCount++;
+                } catch (error) {
+                    logWithTimestamp(`Error processing member: ${error.message}`, 'ERROR');
+                }
+            }
+            
+            // Sort regular members by:
+            // 1. Higher role position first
+            // 2. Earlier join timestamp first (when roles are equal)
+            categorizedMembers.regularMembers.sort((a, b) => {
+                // First sort by role position (higher roles first)
+                if (b.highestRolePosition !== a.highestRolePosition) {
+                    return b.highestRolePosition - a.highestRolePosition;
+                }
+                // Then sort by join timestamp (earlier joins first)
+                return a.joinTimestamp - b.joinTimestamp;
+            });
+            
+            // Sort non-guild members by join timestamp (if available)
+            categorizedMembers.nonGuildMembers.sort((a, b) => a.joinTimestamp - b.joinTimestamp);
+            
+            // Combine the lists in priority order: 
+            // 1. Non-guild members first
+            // 2. Then regular members sorted by role and join time
+            const sortedMembers = [
+                ...categorizedMembers.nonGuildMembers,
+                ...categorizedMembers.regularMembers
+            ];
+            
+            // Store the sorted list for batch processing
+            threadConfig.removalState.remainingMembers = sortedMembers;
+            
+            logWithTimestamp(`Prepared ${sortedMembers.length} members for batch removal in thread ${thread.name} (${categorizedMembers.nonGuildMembers.length} non-guild members, ${categorizedMembers.regularMembers.length} regular members)`, 'INFO');
+        }
+        
+        // Define batch size
+        const BATCH_SIZE = 50;
+        
+        // Process a batch of members
+        const removalState = threadConfig.removalState;
+        const botMember = guild.members.me;
+        
+        // Process up to BATCH_SIZE members in this run
+        const currentBatch = removalState.remainingMembers.slice(0, BATCH_SIZE);
+        removalState.remainingMembers = removalState.remainingMembers.slice(BATCH_SIZE);
+        
+        logWithTimestamp(`Processing batch of up to ${currentBatch.length} members (${removalState.processedCount}/${removalState.targetCount} processed)`, 'INFO');
+        
+        // Track successful removals in this batch
+        let removedInBatch = 0;
+        
+        for (const member of currentBatch) {
+            if (removalState.processedCount >= removalState.targetCount) {
+                break; // We've removed enough members
+            }
+            
+            try {
+                // Skip if member object is invalid
+                if (!member || !member.id) {
+                    logWithTimestamp(`Skipping invalid member object in removal batch`, 'WARN');
+                    continue;
+                }
+                
+                // For regular guild members, check role permissions
+                if (member.username !== 'Unknown (Left Guild)') {
+                    // Check permissions before removing
+                    if (!botMember || !botMember.roles || !botMember.roles.highest) {
+                        logWithTimestamp(`Bot member or roles not properly defined, cannot check permissions`, 'ERROR');
+                        continue;
+                    }
+                    
+                    if (botMember.roles.highest.position <= member.highestRolePosition) {
+                        logWithTimestamp(`Cannot remove member ${member.username} (${member.id}) - higher role than bot`, 'WARN');
+                        removalState.processedCount++; // Count as processed even if we couldn't remove
+                        continue;
+                    }
+                }
+                
+                // Remove member from thread with proper error handling
+                await thread.members.remove(member.id)
+                    .then(() => {
+                        const joinDate = member.joinTimestamp ? new Date(member.joinTimestamp).toISOString() : 'unknown date';
+                        const memberType = member.username === 'Unknown (Left Guild)' ? 'non-guild member' : 'member';
+                        logWithTimestamp(`Removed ${memberType} ${member.username} (${member.id}) from thread ${thread.name} (joined: ${joinDate})`, 'INFO');
+                        removalState.processedCount++;
+                        removedInBatch++;
+                    })
+                    .catch(error => {
+                        logWithTimestamp(`Failed to remove member ${member.username} (${member.id}): ${error.message}`, 'ERROR');
+                    });
+                
+                // Add a small delay between removals to avoid hitting rate limits
+                await new Promise(resolve => setTimeout(resolve, 200));
+                
+            } catch (error) {
+                logWithTimestamp(`Error in member removal process: ${error.message}`, 'ERROR');
+            }
+        }
+        
+        // Update the last batch time
+        removalState.lastBatchTime = Date.now();
+        
+        // Save the updated state
+        this.trackedThreads.set(thread.id, threadConfig);
+        
+        // Determine if we're done or need to continue in future checks
+        if (removalState.processedCount >= removalState.targetCount || removalState.remainingMembers.length === 0) {
+            logWithTimestamp(`Completed member removal: ${removalState.processedCount}/${removalState.targetCount} members removed from ${thread.name}`, 'INFO');
+            // Reset the removal state when we're done
+            delete threadConfig.removalState;
+            this.trackedThreads.set(thread.id, threadConfig);
+        } else {
+            logWithTimestamp(`Batch completed: ${removedInBatch} members removed in this batch. ${removalState.remainingMembers.length} members remaining for future batches.`, 'INFO');
+        }
+        
+    } catch (error) {
+        logWithTimestamp(`Error removing excess members from thread ${thread.id}: ${error.message}`, 'ERROR');
+    }
+}
+        
+        // Define batch size
+        const BATCH_SIZE = 50;
+        
+        // Process a batch of members
+        const removalState = threadConfig.removalState;
+        const botMember = guild.members.me;
+        
+        // Process up to BATCH_SIZE members in this run
+        const currentBatch = removalState.remainingMembers.slice(0, BATCH_SIZE);
+        removalState.remainingMembers = removalState.remainingMembers.slice(BATCH_SIZE);
+        
+        logWithTimestamp(`Processing batch of up to ${currentBatch.length} members (${removalState.processedCount}/${removalState.targetCount} processed)`, 'INFO');
+        
+        // Track successful removals in this batch
+        let removedInBatch = 0;
+        
+        for (const member of currentBatch) {
+            if (removalState.processedCount >= removalState.targetCount) {
+                break; // We've removed enough members
+            }
+            
+            try {
+                // Skip if member object is invalid
+                if (!member || !member.id) {
+                    logWithTimestamp(`Skipping invalid member object in removal batch`, 'WARN');
+                    continue;
+                }
+                
+                // Check permissions before removing
+                if (!botMember || !botMember.roles || !botMember.roles.highest) {
+                    logWithTimestamp(`Bot member or roles not properly defined, cannot check permissions`, 'ERROR');
+                    continue;
+                }
+                
+                if (botMember.roles.highest.position <= member.highestRolePosition) {
+                    logWithTimestamp(`Cannot remove member ${member.username} (${member.id}) - higher role than bot`, 'WARN');
+                    removalState.processedCount++; // Count as processed even if we couldn't remove
+                    continue;
+                }
+                
+                // Remove member from thread with proper error handling
+                await thread.members.remove(member.id)
+                    .then(() => {
+                        logWithTimestamp(`Removed member ${member.username} (${member.id}) from thread ${thread.name}`, 'INFO');
+                        removalState.processedCount++;
+                        removedInBatch++;
+                    })
+                    .catch(error => {
+                        logWithTimestamp(`Failed to remove member ${member.username} (${member.id}): ${error.message}`, 'ERROR');
+                    });
+                
+                // Add a small delay between removals to avoid hitting rate limits
+                await new Promise(resolve => setTimeout(resolve, 200));
+                
+            } catch (error) {
+                logWithTimestamp(`Error in member removal process: ${error.message}`, 'ERROR');
+            }
+        }
+        
+        // Update the last batch time
+        removalState.lastBatchTime = Date.now();
+        
+        // Save the updated state
+        this.trackedThreads.set(thread.id, threadConfig);
+        
+        // Determine if we're done or need to continue in future checks
+        if (removalState.processedCount >= removalState.targetCount || removalState.remainingMembers.length === 0) {
+            logWithTimestamp(`Completed member removal: ${removalState.processedCount}/${removalState.targetCount} members removed from ${thread.name}`, 'INFO');
+            // Reset the removal state when we're done
+            delete threadConfig.removalState;
+            this.trackedThreads.set(thread.id, threadConfig);
+        } else {
+            logWithTimestamp(`Batch completed: ${removedInBatch} members removed in this batch. ${removalState.remainingMembers.length} members remaining for future batches.`, 'INFO');
+        }
+        
+    } catch (error) {
+        logWithTimestamp(`Error removing excess members from thread ${thread.id}: ${error.message}`, 'ERROR');
+    }
+}
+    
+    shutdown() {
+        if (this.checkInterval) {
+            clearInterval(this.checkInterval);
+            this.checkInterval = null;
+        }
+        
+        this.trackedThreads.clear();
+        logWithTimestamp('Member Tracker shutting down...', 'SHUTDOWN');
+    }
+}
+
+module.exports = MemberTracker;

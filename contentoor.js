@@ -292,6 +292,9 @@ async function checkMessageExists(message, retries = 0) {
 }
 
 async function handleWrongThread(message, correctThreadId) {
+    // Add this logging statement
+    logWithTimestamp(`User ${message.author.tag} (${message.author.id}) posted in wrong thread ${message.channel.id}, should be in ${correctThreadId}`, 'INFO');
+    
     const hasAttachments = message.attachments.size > 0;
     let embedDescription = hasAttachments 
         ? 'User uploaded file(s)'
