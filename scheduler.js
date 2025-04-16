@@ -67,6 +67,21 @@ class ThreadCleaner {
     }
 
     /**
+     * Find the highest role index that a member has
+     * @param {Collection} memberRoles - The member's roles collection
+     * @returns {number} - The index of the highest role (-1 if none)
+     */
+    findHighestRole(memberRoles) {
+        for (let i = 5; i >= 0; i--) {
+            const roleId = process.env[`ROLE_${i}_ID`];
+            if (memberRoles.has(roleId)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
      * Check if a member has the correct role for a thread
      * @param {GuildMember} member - The guild member to check
      * @param {string} threadId - The thread ID
@@ -80,13 +95,17 @@ class ThreadCleaner {
             return true;
         }
 
-        // Check if member has the required role for this thread
-        const requiredRoleId = threadToRole.get(threadId);
-        if (!requiredRoleId) {
+        // Get the highest role index for this member
+        const highestRoleIndex = this.findHighestRole(member.roles.cache);
+        if (highestRoleIndex === -1) {
             return false;
         }
 
-        return member.roles.cache.has(requiredRoleId);
+        // Get the correct thread for this role index
+        const correctThreadId = process.env[`THREAD_${highestRoleIndex}_ID`];
+        
+        // Check if the member is in the correct thread for their highest role
+        return threadId === correctThreadId;
     }
 
     /**
@@ -187,7 +206,92 @@ class ThreadCleaner {
     async runNow() {
         return this.performCleanup();
     }
+	
+	async cleanSpecificThread(threadId) {
+    if (this.isRunning) {
+        logWithTimestamp('Thread cleanup is already in progress, skipping', 'WARN');
+        return;
+    }
 
+    this.isRunning = true;
+    const startTime = Date.now();
+    logWithTimestamp(`Starting thread cleanup for specific thread: ${threadId}`, 'INFO');
+
+    try {
+        const { threadToRole, ignoredRoles } = this.getThreadAndRoleMappings();
+        
+        // Check if this thread is configured
+        if (!threadToRole.has(threadId)) {
+            logWithTimestamp(`Thread ${threadId} not configured for cleanup`, 'WARN');
+            this.isRunning = false;
+            return;
+        }
+
+        let totalChecked = 0;
+        let totalRemoved = 0;
+
+        try {
+            const thread = await this.client.channels.fetch(threadId);
+            
+            if (!thread) {
+                logWithTimestamp(`Thread ${threadId} not found`, 'ERROR');
+                this.isRunning = false;
+                return;
+            }
+
+            // Skip non-thread channels
+            if (!thread.isThread()) {
+                logWithTimestamp(`Channel ${threadId} (${thread.name}) is not a thread, skipping`, 'WARN');
+                this.isRunning = false;
+                return;
+            }
+
+            // Fetch all thread members
+            const threadMembers = await thread.members.fetch();
+            logWithTimestamp(`Checking ${threadMembers.size} members in thread ${thread.name} (${threadId})`, 'INFO');
+
+            let removedFromThread = 0;
+
+            // Process each member in the thread
+            for (const [memberId, threadMember] of threadMembers) {
+                // Skip the bot itself
+                if (memberId === this.client.user.id) continue;
+                
+                totalChecked++;
+
+                try {
+                    // Try to fetch the guild member
+                    const guildMember = await thread.guild.members.fetch(memberId).catch(() => null);
+                    
+                    // If member left the server or doesn't have correct role, remove them
+                    if (!guildMember || 
+                        !this.memberHasCorrectRoleForThread(guildMember, threadId, threadToRole, ignoredRoles)) {
+                        
+                        await thread.members.remove(memberId);
+                        removedFromThread++;
+                        totalRemoved++;
+                        
+                        const reason = !guildMember ? 'left server' : 'incorrect role';
+                        logWithTimestamp(`Removed member ${memberId} from thread ${thread.name}: ${reason}`, 'INFO');
+                    }
+                } catch (memberError) {
+                    logWithTimestamp(`Error processing member ${memberId} in thread ${thread.name}: ${memberError.message}`, 'ERROR');
+                }
+            }
+
+            logWithTimestamp(`Thread ${thread.name}: Removed ${removedFromThread} of ${threadMembers.size} members`, 'INFO');
+        } catch (threadError) {
+            logWithTimestamp(`Error processing thread ${threadId}: ${threadError.message}`, 'ERROR');
+        }
+
+        const duration = (Date.now() - startTime) / 1000;
+        logWithTimestamp(`Thread cleanup completed in ${duration.toFixed(2)}s: Checked ${totalChecked} members, removed ${totalRemoved}`, 'INFO');
+    } catch (error) {
+        logWithTimestamp(`Thread cleanup failed: ${error.message}`, 'ERROR');
+    } finally {
+        this.isRunning = false;
+    }
+}
     /**
      * Stop the thread cleaner
      */

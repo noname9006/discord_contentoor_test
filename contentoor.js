@@ -618,26 +618,53 @@ client.on('messageCreate', async (message) => {
         }
         
         // Add support for manual thread cleanup command
-        if (message.content.startsWith('!cleanup threads')) {
-            if (!hasCommandPermission(message.member)) {
-                const embed = new EmbedBuilder()
-                    .setColor(ERROR_COLOR)
-                    .setDescription(`${message.author}, you don't have permission to use this command. Only server administrators can use it.`)
-                    .setFooter({
-                        text: 'Botanix Labs',
-                        iconURL: 'https://a-us.storyblok.com/f/1014909/512x512/026e26392f/dark_512-1.png'
-                    });
-                
-                await message.reply({ embeds: [embed] });
-                logWithTimestamp(`Command access denied for user ${message.author.tag} (${message.author.id}) - Administrator permission required`, 'WARN');
-                return;
-            }
-            
-            const reply = await message.reply('Starting thread cleanup, this may take a while...');
-            await threadCleaner.runNow();
-            await reply.edit('Thread cleanup completed.');
-            return;
+        if (message.content.startsWith('!cleanup thread')) {
+    if (!hasCommandPermission(message.member)) {
+        const embed = new EmbedBuilder()
+            .setColor(ERROR_COLOR)
+            .setDescription(`${message.author}, you don't have permission to use this command. Only server administrators can use it.`)
+            .setFooter({
+                text: 'Botanix Labs',
+                iconURL: 'https://a-us.storyblok.com/f/1014909/512x512/026e26392f/dark_512-1.png'
+            });
+        
+        await message.reply({ embeds: [embed] });
+        logWithTimestamp(`Command access denied for user ${message.author.tag} (${message.author.id}) - Administrator permission required`, 'WARN');
+        return;
+    }
+    
+    // Check if this channel is a thread
+    if (!message.channel.isThread()) {
+        await message.reply('This command must be used in a thread to clean that specific thread.');
+        return;
+    }
+    
+    // Check if this thread is one of the configured threads
+    const threadId = message.channel.id;
+    let isConfiguredThread = false;
+    
+    // Check if this thread is in the environment variables
+    for (let i = 0; i <= 5; i++) {
+        const configuredThreadId = process.env[`THREAD_${i}_ID`];
+        if (configuredThreadId && configuredThreadId === threadId) {
+            isConfiguredThread = true;
+            break;
         }
+    }
+    
+    if (!isConfiguredThread) {
+        await message.reply('This command can only be used in threads that are configured in the environment variables.');
+        return;
+    }
+    
+    const reply = await message.reply('Starting thread cleanup for this thread, this may take a moment...');
+    
+    // Use the specific thread cleaning method
+    await threadCleaner.cleanSpecificThread(threadId);
+    
+    await reply.edit('Thread cleanup completed for this thread.');
+    return;
+}
 
         const isForumPost = await isMessageInForumPost(message);
         if (!isForumPost) return;
