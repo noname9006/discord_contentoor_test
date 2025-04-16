@@ -2,8 +2,7 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, Partials, ChannelType } = require('discord.js');
 const UrlStorage = require('./urlStore');  // Changed to UrlStorage
 const UrlTracker = require('./urlTracker');
-const MemberTracker = require('./memberTracker');
-const { logWithTimestamp } = require('./utils');
+const { logger } = require('./logger');
 const { DB_TIMEOUT, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_COOLDOWN } = require('./config');
 
 const client = new Client({
@@ -66,7 +65,6 @@ async function validateEnvironmentVariables() {
         'MAIN_CHANNEL_ID',
         'AUTO_DELETE_TIMER',
         'DB_TIMEOUT',
-        'MAX_MEMBERS',
         ...Array.from({length: 6}, (_, i) => `ROLE_${i}_ID`),
         ...Array.from({length: 6}, (_, i) => `THREAD_${i}_ID`)
     ];
@@ -101,14 +99,9 @@ async function validateEnvironmentVariables() {
         process.exit(1);
     }
     
-    if (isNaN(parseInt(process.env.MAX_MEMBERS)) || parseInt(process.env.MAX_MEMBERS) <= 0) {
-        logWithTimestamp('Invalid MAX_MEMBERS value. Must be a positive number.', 'ERROR');
-        process.exit(1);
-    }
-    
     // Add logging for command permission configuration
     logWithTimestamp('Command access restricted to server administrators only', 'CONFIG');
-    logWithTimestamp(`Last updated: 2025-04-14 19:57:33 UTC by noname9006`, 'INFO');
+    logWithTimestamp(`Last updated: 2025-03-19 09:20:14 UTC by noname9006`, 'INFO');
 }
 
 
@@ -128,8 +121,7 @@ function checkBotPermissions(guild, channel) {
         'ViewChannel',
         'SendMessages',
         'ManageMessages',
-        'EmbedLinks',
-        'ManageThreads'
+        'EmbedLinks'
     ];
 
     const missingPermissions = requiredPermissions.filter(perm => !botMember.permissions.has(perm));
@@ -293,7 +285,7 @@ async function checkMessageExists(message, retries = 0) {
 
 async function handleWrongThread(message, correctThreadId) {
     // Add this logging statement
-    logWithTimestamp(`User ${message.author.tag} (${message.author.id}) posted in wrong thread ${message.channel.id}, should be in ${correctThreadId}`, 'INFO');
+    logWithTimestamp(`User ${message.author.tag} (${message.author.id}) posted in wrong thread ${message.channel.id}, should be in ${correctThreadId}`, 'WARN');
     
     const hasAttachments = message.attachments.size > 0;
     let embedDescription = hasAttachments 
@@ -551,87 +543,6 @@ async function handleFetchLinksCommand(message) {
     }
 }
 
-// New function to handle check members command
-async function handleCheckMembersCommand(message) {
-    try {
-        // Permission check
-        if (!hasCommandPermission(message.member)) {
-            const embed = new EmbedBuilder()
-                .setColor(ERROR_COLOR)
-                .setDescription(`${message.author}, you don't have permission to use this command. Only server administrators can use it.`)
-                .setFooter({
-                    text: 'Botanix Labs',
-                    iconURL: 'https://a-us.storyblok.com/f/1014909/512x512/026e26392f/dark_512-1.png'
-                });
-            
-            await message.reply({ embeds: [embed] });
-            logWithTimestamp(`Command access denied for user ${message.author.tag} (${message.author.id}) - Administrator permission required`, 'WARN');
-            return;
-        }
-
-        const args = message.content.split(' ');
-        let threadId;
-        
-        if (args.length < 3) {
-            const embed = new EmbedBuilder()
-                .setColor(ERROR_COLOR)
-                .setDescription('Usage: !check members <thread_id>')
-                .setFooter({
-                    text: 'Botanix Labs',
-                    iconURL: 'https://a-us.storyblok.com/f/1014909/512x512/026e26392f/dark_512-1.png'
-                });
-            
-            await message.reply({ embeds: [embed] });
-            return;
-        }
-        
-        threadId = args[2];
-        
-        const processingMsg = await message.reply(`Processing... Checking member count for thread ID: ${threadId}`);
-        
-        // Manually trigger member count check
-        if (!memberTracker.trackedThreads.has(threadId)) {
-            await processingMsg.edit(`Thread ID ${threadId} is not being tracked by the member tracker.`);
-            return;
-        }
-        
-        await memberTracker.checkThreadMemberCount(threadId);
-        
-        const threadConfig = memberTracker.trackedThreads.get(threadId);
-        const thread = await client.channels.fetch(threadId).catch(() => null);
-        
-        if (!thread) {
-            await processingMsg.edit(`Could not fetch thread with ID ${threadId}.`);
-            return;
-        }
-        
-        const memberCount = await memberTracker.getThreadMemberCount(thread);
-        
-        const embed = new EmbedBuilder()
-            .setColor('#0099ff')
-            .setTitle('Thread Member Check')
-            .setDescription(`Member count for thread: ${thread.name}`)
-            .addFields(
-                { name: 'Current Member Count', value: `${memberCount}`, inline: true },
-                { name: 'Maximum Members', value: `${threadConfig.maxMembers}`, inline: true },
-                { name: 'Status', value: memberCount > threadConfig.maxMembers ? 
-                    '⚠️ Exceeds maximum - members will be removed' : 
-                    '✅ Within limit' }
-            )
-            .setFooter({
-                text: 'Botanix Labs',
-                iconURL: 'https://a-us.storyblok.com/f/1014909/512x512/026e26392f/dark_512-1.png'
-            })
-            .setTimestamp();
-
-        await processingMsg.edit({ content: null, embeds: [embed] });
-        
-    } catch (error) {
-        logWithTimestamp(`Error handling check members command: ${error.message}`, 'ERROR');
-        await message.reply('An error occurred while processing the command: ' + error.message).catch(() => {});
-    }
-}
-
 // Cache cleanup
 setInterval(() => {
     const now = Date.now();
@@ -649,20 +560,14 @@ setInterval(() => {
     }
 }, CACHE_CLEANUP_INTERVAL);
 
-// Create instances
+// Create instances - MODIFIED: Create a single UrlStorage instance and pass it to UrlTracker
 const urlStore = new UrlStorage();
-const urlTracker = new UrlTracker(client, urlStore);
-let memberTracker; // Will be initialized in the ready event
+const urlTracker = new UrlTracker(client, urlStore); // Pass the existing instance
 
 client.once('ready', async () => {
     try {
         await urlStore.init();  // Initialize urlStore first
         await urlTracker.init(); // Then initialize urlTracker
-        
-        // Initialize and start the member tracker
-        memberTracker = new MemberTracker(client);
-        await memberTracker.init();
-        
         initializeMappings();
         
         const mainChannel = await client.channels.fetch(process.env.MAIN_CHANNEL_ID);
@@ -670,9 +575,10 @@ client.once('ready', async () => {
             throw new Error('MAIN_CHANNEL_ID must be a forum channel');
         }
         
-        logWithTimestamp('Bot initialized successfully', 'STARTUP');
+        logger.startup('Bot initialized successfully');
         logWithTimestamp(`Monitoring forum channel: ${mainChannel.name}`, 'CONFIG');
-        logWithTimestamp(`Last updated: 2025-04-14 19:57:33 UTC by noname9006`, 'INFO');
+        // Remove this line:
+        // logWithTimestamp(`Last updated: 2025-03-12 18:14:35 UTC by noname9006`, 'INFO');
 
         // URL cleanup has been disabled
         logWithTimestamp('URL cleanup has been disabled - URLs will be kept forever', 'CONFIG');
@@ -683,32 +589,13 @@ client.once('ready', async () => {
     }
 });
 
-// Add new event handler for threadMembersUpdate event
-client.on('threadMembersUpdate', async (oldMembers, newMembers) => {
-    if (!memberTracker) return;
-    
-    const threadId = newMembers.thread.id;
-    
-    // Check if this is a thread we're tracking
-    if (memberTracker.trackedThreads.has(threadId)) {
-        logWithTimestamp(`Thread members updated in tracked thread ${threadId}`, 'INFO');
-        await memberTracker.checkThreadMemberCount(threadId);
-    }
-});
-
 client.on('messageCreate', async (message) => {
     try {
         if (message.author.bot || !message.guild || !message.member) return;
 
-        // Handle commands
+        // Handle fetch links command before forum post check
         if (message.content.startsWith('!fetch links')) {
             await handleFetchLinksCommand(message);
-            return;
-        }
-        
-        // Handle member check command
-        if (message.content.startsWith('!check members')) {
-            await handleCheckMembersCommand(message);
             return;
         }
 
@@ -782,10 +669,11 @@ process.on('unhandledRejection', async (reason, promise) => {
 });
 
 process.on('SIGINT', () => {
-    logWithTimestamp('Shutting down...', 'SHUTDOWN');
+    logger.shutdown('Shutting down...');
     urlStore.shutdown();
     urlTracker.shutdown();
     if (memberTracker) memberTracker.shutdown();
+    logger.close();  // Close logger streams
     client.destroy();
     process.exit(0);
 });
@@ -794,7 +682,6 @@ process.on('SIGTERM', () => {
     logWithTimestamp('Shutting down...', 'SHUTDOWN');
     urlStore.shutdown();
     urlTracker.shutdown();
-    if (memberTracker) memberTracker.shutdown();
     client.destroy();
     process.exit(0);
 });
