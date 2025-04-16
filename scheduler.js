@@ -9,10 +9,6 @@ class ThreadCleaner {
         this.isRunning = false;
     }
 
-    /**
-     * Initialize the thread cleaner with a cron schedule
-     * @param {string} cronExpression - Cron expression for the schedule (e.g. '0 */6 * * *' for every 6 hours)
-     */
     init(cronExpression) {
         if (!cronExpression || typeof cronExpression !== 'string') {
             logWithTimestamp('Invalid cron expression for thread cleaning schedule', 'ERROR');
@@ -38,9 +34,6 @@ class ThreadCleaner {
         }
     }
 
-    /**
-     * Get the thread IDs and role IDs from environment variables
-     */
     getThreadAndRoleMappings() {
         const threadIds = [];
         const roleToThread = new Map();
@@ -66,11 +59,6 @@ class ThreadCleaner {
         return { threadIds, roleToThread, threadToRole, ignoredRoles };
     }
 
-    /**
-     * Find the highest role index that a member has
-     * @param {Collection} memberRoles - The member's roles collection
-     * @returns {number} - The index of the highest role (-1 if none)
-     */
     findHighestRole(memberRoles) {
         for (let i = 5; i >= 0; i--) {
             const roleId = process.env[`ROLE_${i}_ID`];
@@ -81,14 +69,6 @@ class ThreadCleaner {
         return -1;
     }
 
-    /**
-     * Check if a member has the correct role for a thread
-     * @param {GuildMember} member - The guild member to check
-     * @param {string} threadId - The thread ID
-     * @param {Map} threadToRole - Map of thread IDs to role IDs
-     * @param {Set} ignoredRoles - Set of ignored role IDs
-     * @returns {boolean} - Whether the member should be allowed in the thread
-     */
     memberHasCorrectRoleForThread(member, threadId, threadToRole, ignoredRoles) {
         // Members with ignored roles are always allowed
         if (member.roles.cache.some(role => ignoredRoles.has(role.id))) {
@@ -108,9 +88,6 @@ class ThreadCleaner {
         return threadId === correctThreadId;
     }
 
-    /**
-     * Perform the cleanup on all configured threads
-     */
     async performCleanup() {
         if (this.isRunning) {
             logWithTimestamp('Thread cleanup is already in progress, skipping', 'WARN');
@@ -200,9 +177,6 @@ class ThreadCleaner {
         }
     }
 
-    /**
-     * Run the cleanup manually (outside of schedule)
-     */
     async runNow() {
         return this.performCleanup();
     }
@@ -292,9 +266,7 @@ class ThreadCleaner {
         this.isRunning = false;
     }
 }
-    /**
-     * Stop the thread cleaner
-     */
+
     stop() {
         if (this.schedule) {
             this.schedule.stop();
