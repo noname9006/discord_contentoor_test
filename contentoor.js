@@ -2,7 +2,8 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, Partials, ChannelType } = require('discord.js');
 const UrlStorage = require('./urlStore');  // Changed to UrlStorage
 const UrlTracker = require('./urlTracker');
-const { logger } = require('./logger');
+const ThreadCleaner = require('./scheduler'); // Add the ThreadCleaner
+const { logWithTimestamp } = require('./utils');
 const { DB_TIMEOUT, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_COOLDOWN } = require('./config');
 
 const client = new Client({
@@ -25,6 +26,7 @@ const MAX_FETCH_RETRIES = 3;
 const CACHE_CLEANUP_INTERVAL = 300000; // 5 minutes
 const THREAD_CACHE_TTL = 3600000; // 1 hour
 const URL_HISTORY_LIMIT = 10;
+const THREAD_CLEANUP_SCHEDULE = process.env.THREAD_CLEANUP_SCHEDULE || '0 */6 * * *'; // Default to every 6 hours
 
 // Rate limiting and caching
 const rateLimitMap = new Map();
@@ -83,7 +85,7 @@ async function validateEnvironmentVariables() {
 
     idVariables.forEach(varName => {
         const value = process.env[varName];
-        if (!/^\d+$/.test(value)) {
+        if (value && !/^\d+$/.test(value)) {
             logWithTimestamp(`Invalid Discord ID format for ${varName}: ${value}`, 'ERROR');
             process.exit(1);
         }
@@ -99,11 +101,24 @@ async function validateEnvironmentVariables() {
         process.exit(1);
     }
     
+    // Check thread cleanup schedule format if provided
+    if (process.env.THREAD_CLEANUP_SCHEDULE) {
+        try {
+            const cron = require('node-cron');
+            if (!cron.validate(process.env.THREAD_CLEANUP_SCHEDULE)) {
+                logWithTimestamp(`Invalid cron expression for THREAD_CLEANUP_SCHEDULE: ${process.env.THREAD_CLEANUP_SCHEDULE}`, 'ERROR');
+                process.exit(1);
+            }
+        } catch (error) {
+            logWithTimestamp(`Error validating THREAD_CLEANUP_SCHEDULE: ${error.message}`, 'ERROR');
+            process.exit(1);
+        }
+    }
+    
     // Add logging for command permission configuration
     logWithTimestamp('Command access restricted to server administrators only', 'CONFIG');
-    logWithTimestamp(`Last updated: 2025-03-19 09:20:14 UTC by noname9006`, 'INFO');
+    logWithTimestamp(`Last updated: 2025-04-16 13:59:46 UTC by noname9006`, 'INFO');
 }
-
 
 function hasCommandPermission(member) {
     // Only allow users with Administrator permission
@@ -284,9 +299,6 @@ async function checkMessageExists(message, retries = 0) {
 }
 
 async function handleWrongThread(message, correctThreadId) {
-    // Add this logging statement
-    logWithTimestamp(`User ${message.author.tag} (${message.author.id}) posted in wrong thread ${message.channel.id}, should be in ${correctThreadId}`, 'WARN');
-    
     const hasAttachments = message.attachments.size > 0;
     let embedDescription = hasAttachments 
         ? 'User uploaded file(s)'
@@ -563,6 +575,7 @@ setInterval(() => {
 // Create instances - MODIFIED: Create a single UrlStorage instance and pass it to UrlTracker
 const urlStore = new UrlStorage();
 const urlTracker = new UrlTracker(client, urlStore); // Pass the existing instance
+const threadCleaner = new ThreadCleaner(client); // Initialize thread cleaner
 
 client.once('ready', async () => {
     try {
@@ -570,16 +583,21 @@ client.once('ready', async () => {
         await urlTracker.init(); // Then initialize urlTracker
         initializeMappings();
         
+        // Initialize thread cleaner
+        if (threadCleaner.init(THREAD_CLEANUP_SCHEDULE)) {
+            logWithTimestamp(`Thread cleaner scheduled: ${THREAD_CLEANUP_SCHEDULE}`, 'CONFIG');
+        } else {
+            logWithTimestamp('Failed to initialize thread cleaner', 'ERROR');
+        }
+        
         const mainChannel = await client.channels.fetch(process.env.MAIN_CHANNEL_ID);
         if (!mainChannel || mainChannel.type !== ChannelType.GuildForum) {
             throw new Error('MAIN_CHANNEL_ID must be a forum channel');
         }
         
-        logger.startup('Bot initialized successfully');
+        logWithTimestamp('Bot initialized successfully', 'STARTUP');
         logWithTimestamp(`Monitoring forum channel: ${mainChannel.name}`, 'CONFIG');
-        // Remove this line:
-        // logWithTimestamp(`Last updated: 2025-03-12 18:14:35 UTC by noname9006`, 'INFO');
-
+        
         // URL cleanup has been disabled
         logWithTimestamp('URL cleanup has been disabled - URLs will be kept forever', 'CONFIG');
         
@@ -596,6 +614,28 @@ client.on('messageCreate', async (message) => {
         // Handle fetch links command before forum post check
         if (message.content.startsWith('!fetch links')) {
             await handleFetchLinksCommand(message);
+            return;
+        }
+        
+        // Add support for manual thread cleanup command
+        if (message.content.startsWith('!cleanup threads')) {
+            if (!hasCommandPermission(message.member)) {
+                const embed = new EmbedBuilder()
+                    .setColor(ERROR_COLOR)
+                    .setDescription(`${message.author}, you don't have permission to use this command. Only server administrators can use it.`)
+                    .setFooter({
+                        text: 'Botanix Labs',
+                        iconURL: 'https://a-us.storyblok.com/f/1014909/512x512/026e26392f/dark_512-1.png'
+                    });
+                
+                await message.reply({ embeds: [embed] });
+                logWithTimestamp(`Command access denied for user ${message.author.tag} (${message.author.id}) - Administrator permission required`, 'WARN');
+                return;
+            }
+            
+            const reply = await message.reply('Starting thread cleanup, this may take a while...');
+            await threadCleaner.runNow();
+            await reply.edit('Thread cleanup completed.');
             return;
         }
 
@@ -669,11 +709,10 @@ process.on('unhandledRejection', async (reason, promise) => {
 });
 
 process.on('SIGINT', () => {
-    logger.shutdown('Shutting down...');
+    logWithTimestamp('Shutting down...', 'SHUTDOWN');
     urlStore.shutdown();
     urlTracker.shutdown();
-    if (memberTracker) memberTracker.shutdown();
-    logger.close();  // Close logger streams
+    threadCleaner.stop();
     client.destroy();
     process.exit(0);
 });
@@ -682,6 +721,7 @@ process.on('SIGTERM', () => {
     logWithTimestamp('Shutting down...', 'SHUTDOWN');
     urlStore.shutdown();
     urlTracker.shutdown();
+    threadCleaner.stop();
     client.destroy();
     process.exit(0);
 });
